@@ -107,3 +107,4 @@ mlruns/
 *.tar.gz
 *.rar
 *.7z
+third_party/
