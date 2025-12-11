@@ -9,7 +9,7 @@ ninja>=1.10
 h5py>=2.9.0
 imageio>=2.21.1
 ipywidgets>=7.6
-jaxtyping>=0.2.15
+jaxtyping==0.2.19
 jupyterlab>=3.3.4
 matplotlib>=3.6.0
 mediapy>=1.1.0
@@ -44,6 +44,10 @@ pytorch-msssim
 pathos
 packaging
 fpsample
+omegaconf==2.3.0
+easydict
+einops
+moviepy==1.0.3
 
 [:platform_machine != "arm64"]
 rawpy>=0.18.1
