@@ -3,12 +3,14 @@ import os
 from argparse import ArgumentParser
 from read_dataset.read_kitti360 import ReadKITTI360Data
 from read_dataset.read_waymo import ReadWaymoData
+from read_dataset.read_nuscenes import ReadNuScenesData
 from typing import Literal, Optional
 from PIL import Image
 import cv2
 from rich.console import Console
 from read_dataset.generate_pcd import PCDGenerator
 from read_dataset.generate_waymo_pcd import WaymoPCDGenerator
+from read_dataset.generate_nuscenes_pcd import NuScenesPCDGenerator
 
 CONSOLE = Console(width=120)
 
@@ -29,7 +31,11 @@ class System():
     depth_cosistency: bool =  True
 
     def __init__(self,save_dir,sys_augments) -> None:
-        self.seq_id = '2013_05_28_drive_{:04d}_sync'.format(sys_augments.seq_id)
+        # Set sequence ID format based on dataset
+        if sys_augments.dataset == 'kitti360':
+            self.seq_id = '2013_05_28_drive_{:04d}_sync'.format(sys_augments.seq_id)
+        else:
+            self.seq_id = sys_augments.seq_id  # For waymo and nuscenes, use seq_id directly
         
         self.frame_start = sys_augments.start_index
         self.use_semantics = sys_augments.use_semantic
@@ -42,7 +48,7 @@ class System():
         # Point cloud downsampling configuration
         # Full image: downsampling rate of 3, approximately 2M GS points per scene
         # Drop50, Drop25: downsampling rate can be set to 2, approximately 2M points per scene
-        self.downscale_pcd = 1   
+        self.downscale_pcd = getattr(sys_augments, 'downscale_pcd', 1)
 
         if sys_augments.dataset == 'waymo':
             self.data_reader = ReadWaymoData(save_dir=save_dir,sequence= sys_augments.seq_id,root_dir=sys_augments.root_dir)
@@ -50,7 +56,7 @@ class System():
                                             save_dir= sys_augments.pcd_sparsity,
                                             frame_start=self.frame_start,
                                             filer_sky= self.filter_pcd_sky,
-                                            depth_cosistency=True,
+                                            depth_cosistency=getattr(sys_augments, 'depth_consistency', True),
                                             )
         elif sys_augments.dataset == 'kitti360':
             self.data_reader = ReadKITTI360Data(save_dir=save_dir,sequence=self.seq_id, spars=self.pcd_sparsity,root_dir=sys_augments.root_dir)
@@ -61,6 +67,28 @@ class System():
                                             filer_sky= self.filter_pcd_sky,
                                             depth_cosistency=self.depth_cosistency,
                                             )
+        elif sys_augments.dataset == 'nuscenes':
+            # Get camera list for nuScenes (default to [0] for CAM_FRONT)
+            cameras = getattr(sys_augments, 'nuscenes_cameras', [0])
+            if isinstance(cameras, str):
+                # Parse comma-separated string
+                cameras = [int(c.strip()) for c in cameras.split(',')]
+            elif isinstance(cameras, int):
+                cameras = [cameras]
+            
+            self.data_reader = ReadNuScenesData(
+                save_dir=save_dir,
+                sequence=sys_augments.seq_id,
+                root_dir=sys_augments.root_dir,
+                cameras=cameras
+            )
+            self.pcd_generator = NuScenesPCDGenerator(
+                spars=self.pcd_sparsity,
+                save_dir=sys_augments.pcd_sparsity,
+                frame_start=self.frame_start,
+                filer_sky=self.filter_pcd_sky,
+                depth_cosistency=getattr(sys_augments, 'depth_consistency', True),
+            )
         CONSOLE.print(f"Sparity: {sys_augments.pcd_sparsity} !",justify="center")
 
         
@@ -127,12 +155,66 @@ class System():
                                     W=self.W,
                                     down_scale=self.downscale_pcd,
                                     )
+
+    def NuScenes_forward(self, num_frames):
+        """This function is designed for nuScenes"""        
+        poses, intrinsics, self.dir_name, info = self.data_reader.generate_json(
+            frame_start=self.frame_start, num_frames=num_frames
+        )
+        self.H = info[0]
+        self.W = info[1]
+
+        # Use standalone scripts for depth and mask generation (recommended)
+        # Or use legacy methods for backward compatibility
+        use_standalone_scripts = os.getenv('USE_STANDALONE_SCRIPTS', 'false').lower() == 'true'
         
+        if self.use_metric and not os.path.exists(os.path.join(self.dir_name, "depth")):
+            if use_standalone_scripts:
+                CONSOLE.log("Using standalone script for depth generation")
+                depth_script = os.path.join(os.path.dirname(__file__), 'gen_nuscenes_depth_mask.py')
+                gpu_id = os.getenv('DEPTH_GPU_ID', '6')
+                cmd = f"python {depth_script} --scene_dir {self.dir_name} --gen_depth --depth_gpu_id {gpu_id}"
+                os.system(cmd)
+            else:
+                self.gen_metric_depth(dataset='nuscenes')
+        else:
+            CONSOLE.log(" Skip depth output")
+
+        # whether output semantic map
+        if self.use_semantics and not os.path.exists(os.path.join(self.dir_name, "semantic")):
+            if use_standalone_scripts:
+                CONSOLE.log("Using standalone script for semantic and sky mask generation")
+                mask_script = os.path.join(os.path.dirname(__file__), 'gen_nuscenes_depth_mask.py')
+                gpu_id = os.getenv('SEMANTIC_GPU_ID', '0')
+                cmd = f"python {mask_script} --scene_dir {self.dir_name} --gen_semantic --gen_sky_mask --semantic_gpu_id {gpu_id}"
+                os.system(cmd)
+            else:
+                self.gen_semantic()
+                self.gen_sky_mask()
+        else:
+            CONSOLE.log(" Skip semantic output")
+  
+        # whether accumulate the pointcloud
+        if self.filter_pcd_sky:
+            assert (self.use_semantics == True) or (os.path.exists(os.path.join(self.dir_name, "semantic")))
+
+        if self.pcd_sparsity is None:
+            return
+        else:
+            self.pcd_generator.forward(dir_name=self.dir_name,
+                                    poses=poses,
+                                    intrinsics=intrinsics,
+                                    H=self.H,
+                                    W=self.W,
+                                    down_scale=self.downscale_pcd,
+                                    )
 
     def gen_metric_depth(self,dataset='kitti360'):
         """We use the metric DepthV2 Giant Model. When predict the waymo, we need to run on the other GPU"""
         # Note: dataset is specified as kitti360 because metric3d code uses dataset type to determine intrinsics
         # If you need to modify intrinsics, please modify the original code in mono/utils/custom_data.py
+        if self.dir_name is None:
+            raise ValueError("dir_name is None, cannot generate metric depth")
         metric3d_path = os.getenv('METRIC3D_PATH', '/home/smiao/Gen_Dataset/dataset_methods/metric3d')
         model_path = os.getenv('METRIC3D_MODEL_PATH', '/nas/users/smiao/model_zoo/metric3d/metric_depth_vit_giant2_800k.pth')
         gpu_id = os.getenv('DEPTH_GPU_ID', '6')
@@ -146,37 +228,46 @@ class System():
         os.system(cmd)
 
     def gen_semantic(self):
-        nvi_sem_path = os.getenv('NVI_SEM_PATH', '/home/smiao/Gen_Dataset/dataset_methods/nvi_sem')
-        checkpoint_path = os.getenv('NVI_SEM_CHECKPOINT', '/home/smiao/Gen_Dataset/dataset_methods/nvi_sem/checkpoints/cityscapes_ocrnet.HRNet_Mscale_outstanding-turtle.pth')
-        gpu_id = os.getenv('SEMANTIC_GPU_ID', '6')
+        # 使用 OneFormer (Hugging Face Transformers) 替代 nvi_sem
+        if self.dir_name is None:
+            raise ValueError("dir_name is None, cannot generate semantic")
+        script_path = os.path.join(os.path.dirname(__file__), 'gen_semantic_oneformer.py')
+        gpu_id = os.getenv('SEMANTIC_GPU_ID', '0')
+        model_name = os.getenv('ONEFORMER_MODEL_NAME', 'shi-labs/oneformer_cityscapes_swin_large')
         
-        cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} python {nvi_sem_path}/train.py --dataset cityscapes --cv 0 \
-               --bs_val 1 --eval folder --n_scales 1.0 --dump_assets --dump_all_images \
-               --snapshot {checkpoint_path}\
-               --arch ocrnet.HRNet_Mscale --result_dir {os.path.join(self.dir_name, 'semantic')} --eval_folder {self.dir_name}"
+        cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} python {script_path} \
+               --input_dir {self.dir_name} \
+               --output_dir {self.dir_name} \
+               --model_name {model_name} \
+               --task semantic \
+               --device cuda \
+               --gpu_id {gpu_id}"
         
         os.system(cmd)
-        # Clean up unnecessary files, keep only folders
-        os.system(f"find {os.path.join(self.dir_name, 'semantic')} -maxdepth 1 -type f -delete")
 
     def gen_sky_mask(self):
+        if self.dir_name is None:
+            raise ValueError("dir_name is None, cannot generate sky mask")
         instance_path = os.path.join(self.dir_name, 'semantic', 'instance')
-        save_path = os.path.join(self.dir_name, 'mask')
-        os.makedirs(save_path,exist_ok=True)
-        image_height, image_width = self.H, self.W
+        save_path = os.path.join(self.dir_name, 'sky_masks')
+        os.makedirs(save_path, exist_ok=True)
+        image_height, image_width = int(self.H), int(self.W)
      
         for instance_fn in sorted(os.listdir(instance_path)):
             mask = np.ones((image_height, image_width), dtype=np.uint8)
             instance_file = os.path.join(instance_path, instance_fn)
             instance = cv2.imread(instance_file, -1)
-            mask[instance==10] = 0
-            mask = Image.fromarray(mask * 255)
+            # Sky class ID = 10, set to 0 (sky), others to 255 (non-sky)
+            mask[instance == 10] = 0
+            mask[instance != 10] = 255
+            mask = Image.fromarray(mask)
+            # Save with same filename format: {frame_idx:03d}_{cam_id}.png
             mask.save(os.path.join(save_path, instance_fn))
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Datasets parameters")
     parser.add_argument('--start_index',type = int,help=' Start index of Data',default=0)
-    parser.add_argument('--num_images',type = int,help='Num images',default=40)
+    parser.add_argument('--num_images',type = int,help='Num images (None means process all frames)',default=None)
     parser.add_argument('--seq_id',type = int,help='kitti360 sequence_id',default=0)
     parser.add_argument('--use_semantic',action='store_true')
     parser.add_argument('--use_metric_depth',action='store_true')
@@ -184,7 +275,12 @@ if __name__ == "__main__":
     parser.add_argument('--root_dir',type=str,default='/data0/datasets/KITTI-360/')
     parser.add_argument('--save_dir',type=str,default='/data1/smiao/waymo_new_infer')
     parser.add_argument('--pcd_sparsity', type=str, choices=['Drop90', 'Drop50', 'Drop80', 'Drop25','full'], help='Point cloud sparsity')
-    parser.add_argument('--dataset',type=str,choices=['kitti360','waymo'],default='kitti360')
+    parser.add_argument('--dataset',type=str,choices=['kitti360','waymo','nuscenes'],default='kitti360')
+    parser.add_argument('--downscale_pcd', type=int, default=1, help='Point cloud downsampling rate (1/2/3)')
+    parser.add_argument('--depth_consistency', action='store_true', default=None, 
+                        help='Enable depth consistency check (default: True for kitti360/nuscenes, True for waymo)')
+    parser.add_argument('--nuscenes_cameras', type=str, default='0', 
+                        help='Comma-separated list of camera IDs for nuScenes (0-5, default: 0 for CAM_FRONT)')
 
     config = parser.parse_args()
     save_idr = config.save_dir
@@ -195,8 +291,10 @@ if __name__ == "__main__":
     system = System(save_dir=save_idr,sys_augments=sys_augments)
 
     if config.dataset == 'waymo':
-         system.Waymo_forward(num_frames=config.num_images)
+         system.Waymo_forward(num_frames=config.num_images if config.num_images is not None else 999999)
     elif config.dataset == 'kitti360':
-        system.forward(num_frames=config.num_images)
+        system.forward(num_frames=config.num_images if config.num_images is not None else 999999)
+    elif config.dataset == 'nuscenes':
+        system.NuScenes_forward(num_frames=config.num_images)
     else:
         raise ValueError(f"Invalid dataset: {config.dataset}")

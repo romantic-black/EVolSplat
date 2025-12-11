@@ -68,7 +68,7 @@ class PCDGenerator():
                if i % 4 == 2 or i % 4 == 3:
                      continue
             elif self.sparsity == 'Drop80':
-                if i % 10 != 0 or i % 10 != 1:
+                if i % 10 != 0 and i % 10 != 1:  # Keep only 20% (frames where i%10==0 or 1)
                     continue 
             elif self.sparsity == 'Drop25':
                 if i % 4 == 2:
