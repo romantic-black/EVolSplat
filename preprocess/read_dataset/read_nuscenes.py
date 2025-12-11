@@ -36,18 +36,18 @@ class ReadNuScenesData():
             5: 'CAM_BACK'
         }
 
-    def generate_json(self, frame_start=0, num_frames=40):
+    def generate_json(self, frame_start=0, num_frames=None):
         """
         Generate transforms.json and return poses, intrinsics, dir_name, info.
         
         Args:
             frame_start: Starting frame index
-            num_frames: Number of frames to process
+            num_frames: Number of frames to process (None means process all frames)
             
         Returns:
             poses: List of poses (one per frame per camera) or dict structure
             intrinsics: List of intrinsics (one per frame per camera)
-            dir_name: Output directory name
+            dir_name: Scene directory path (directly use nuscenes_preprocess output)
             info: Tuple of (H, W) or camera-specific info
         """
         # Construct scene path: assume root_dir contains processed data with scene folders
@@ -66,10 +66,33 @@ class ReadNuScenesData():
         if scene_path is None:
             raise ValueError(f"Scene {self.sequence:03d} not found in {self.data_root}")
         
-        self.dir_name = os.path.join(self.save_root, 
-                                     f'seq_{self.sequence:03d}_nuscenes_{frame_start:04d}_{num_frames}')
-        os.makedirs(self.dir_name, exist_ok=True)
-        CONSOLE.log(f"Create the BaseDir at {self.dir_name} ! \n")
+        # Directly use scene path instead of creating new directory
+        self.dir_name = scene_path
+        CONSOLE.log(f"Using scene directory: {self.dir_name} ! \n")
+        
+        # Auto-detect all frames if num_frames is None
+        if num_frames is None:
+            images_dir = os.path.join(scene_path, 'images')
+            if os.path.exists(images_dir):
+                # Find all frame indices from image files
+                image_files = [f for f in os.listdir(images_dir) 
+                              if f.endswith('.jpg') or f.endswith('.png')]
+                frame_indices = set()
+                for img_file in image_files:
+                    try:
+                        # Parse frame index from filename: {frame_idx:03d}_{cam_id}.jpg
+                        frame_idx = int(img_file.split('_')[0])
+                        frame_indices.add(frame_idx)
+                    except (ValueError, IndexError):
+                        continue
+                if frame_indices:
+                    max_frame = max(frame_indices)
+                    num_frames = max_frame + 1 - frame_start
+                    CONSOLE.log(f"Auto-detected {num_frames} frames (frame_start={frame_start}, max_frame={max_frame})")
+                else:
+                    raise ValueError(f"No valid image files found in {images_dir}")
+            else:
+                raise ValueError(f"Images directory not found: {images_dir}")
         
         # Read data from processed nuScenes format
         poses, intrinsics, info = self.read_data(scene_path, frame_start, num_frames)
@@ -77,23 +100,18 @@ class ReadNuScenesData():
     
     def pose_normalization(self, poses):
         """
-        Normalize poses using midpoint frame as origin.
-        Similar to Waymo implementation.
+        Align poses with first frame (consistent with nuscenes_sourceloader.py).
+        Note: Poses are already aligned in read_data() using first camera's first frame.
+        OPENCV2DATASET is identity matrix, so no additional coordinate conversion needed.
+        
+        Returns:
+            poses: Aligned poses (unchanged, already aligned in read_data)
+            inv_pose: Identity matrix (for compatibility)
         """
-        camera_type_matrix = np.array([1, -1, -1])
-        
-        mid_frames = poses.shape[0] // 2
-        inv_pose = np.linalg.inv(poses[mid_frames])
-        for i, pose in enumerate(poses):
-            if i == mid_frames:
-                poses[i] = np.eye(4)
-            else:
-                poses[i] = np.dot(inv_pose, poses[i])  # Note: inv_pose is left-multiplied
-        
-        # Apply OpenCV to OpenGL coordinate system conversion
-        for i in range(poses.shape[0]):
-            poses[i, :3, :3] = poses[i, :3, :3] * camera_type_matrix
-        
+        # Poses are already aligned in read_data() with first camera's first frame
+        # OPENCV2DATASET is identity matrix, so no additional conversion needed
+        # Return identity matrix for inv_pose for compatibility with transforms.json
+        inv_pose = np.eye(4)
         return poses, inv_pose
     
     def read_data(self, scene_path, frame_start, num_frames):
@@ -171,13 +189,14 @@ class ReadNuScenesData():
                 # Load extrinsics (cam_to_world)
                 cam2world = np.loadtxt(extrinsic_file)
                 
-                # Align with first camera's first frame (if available)
+                # Align with first camera's first frame (consistent with nuscenes_sourceloader.py)
                 if camera_front_start is not None:
                     cam2world = np.linalg.inv(camera_front_start) @ cam2world
                 
-                # Note: Extrinsics from nuscenes_preprocess.py are already cam_to_world
-                # The coordinate conversion is handled in pose_normalization
-                # So we don't apply OPENCV2DATASET here
+                # Apply OPENCV2DATASET (identity matrix, so no actual transformation)
+                # This is for consistency with nuscenes_sourceloader.py
+                OPENCV2DATASET = np.array([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [0, 0, 0, 1]])
+                cam2world = cam2world @ OPENCV2DATASET
                 
                 all_poses.append(cam2world)
                 all_img_names.append(f'{frame_idx:03d}_{cam_id}')
@@ -190,13 +209,13 @@ class ReadNuScenesData():
         poses = np.stack(all_poses)
         intrinsics = np.stack(all_intrinsics)
         
-        # Normalize poses
+        # Normalize poses (already aligned, just get inv_pose for compatibility)
         poses, inv_pose = self.pose_normalization(poses)
         
         # Get image dimensions
         H, W = imgs[0].shape[0], imgs[0].shape[1]
         
-        # Generate transforms.json
+        # Generate transforms.json (optional, for compatibility with nerfstudio format)
         def listify_matrix(matrix):
             matrix_list = []
             for row in matrix:
@@ -222,22 +241,22 @@ class ReadNuScenesData():
         }
         out_data['frames'] = []
         
-        # Save images and create frame entries
+        # Create frame entries (images are already in scene directory, no need to copy)
         for i in range(poses.shape[0]):
             frame_data = {
-                'file_path': f'./{all_img_names[i]}.jpg',
+                'file_path': f'./images/{all_img_names[i]}.jpg',  # Point to images subdirectory
                 'transform_matrix': listify_matrix(poses[i]),
                 'intrinsics': intrinsics[i].tolist(),
             }
             out_data['frames'].append(frame_data)
-            
-            # Save image
-            filename = os.path.join(self.dir_name, f'{all_img_names[i]}.jpg')
-            imageio.imwrite(filename, imgs[i])
         
-        # Save transforms.json
-        with open(os.path.join(self.dir_name, 'transforms.json'), 'w') as out_file:
+        # Save transforms.json in scene directory
+        if self.dir_name is None:
+            raise ValueError("dir_name is None, cannot save transforms.json")
+        transforms_json_path = os.path.join(self.dir_name, 'transforms.json')
+        with open(transforms_json_path, 'w') as out_file:
             json.dump(out_data, out_file, indent=4)
+        CONSOLE.log(f"Saved transforms.json to {transforms_json_path}")
         
         return poses, intrinsics, (H, W)
 

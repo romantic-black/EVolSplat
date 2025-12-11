@@ -164,15 +164,33 @@ class System():
         self.H = info[0]
         self.W = info[1]
 
+        # Use standalone scripts for depth and mask generation (recommended)
+        # Or use legacy methods for backward compatibility
+        use_standalone_scripts = os.getenv('USE_STANDALONE_SCRIPTS', 'false').lower() == 'true'
+        
         if self.use_metric and not os.path.exists(os.path.join(self.dir_name, "depth")):
-            self.gen_metric_depth(dataset='nuscenes')
+            if use_standalone_scripts:
+                CONSOLE.log("Using standalone script for depth generation")
+                depth_script = os.path.join(os.path.dirname(__file__), 'gen_nuscenes_depth_mask.py')
+                gpu_id = os.getenv('DEPTH_GPU_ID', '6')
+                cmd = f"python {depth_script} --scene_dir {self.dir_name} --gen_depth --depth_gpu_id {gpu_id}"
+                os.system(cmd)
+            else:
+                self.gen_metric_depth(dataset='nuscenes')
         else:
             CONSOLE.log(" Skip depth output")
 
         # whether output semantic map
         if self.use_semantics and not os.path.exists(os.path.join(self.dir_name, "semantic")):
-            self.gen_semantic()
-            self.gen_sky_mask()
+            if use_standalone_scripts:
+                CONSOLE.log("Using standalone script for semantic and sky mask generation")
+                mask_script = os.path.join(os.path.dirname(__file__), 'gen_nuscenes_depth_mask.py')
+                gpu_id = os.getenv('SEMANTIC_GPU_ID', '0')
+                cmd = f"python {mask_script} --scene_dir {self.dir_name} --gen_semantic --gen_sky_mask --semantic_gpu_id {gpu_id}"
+                os.system(cmd)
+            else:
+                self.gen_semantic()
+                self.gen_sky_mask()
         else:
             CONSOLE.log(" Skip semantic output")
   
@@ -195,6 +213,8 @@ class System():
         """We use the metric DepthV2 Giant Model. When predict the waymo, we need to run on the other GPU"""
         # Note: dataset is specified as kitti360 because metric3d code uses dataset type to determine intrinsics
         # If you need to modify intrinsics, please modify the original code in mono/utils/custom_data.py
+        if self.dir_name is None:
+            raise ValueError("dir_name is None, cannot generate metric depth")
         metric3d_path = os.getenv('METRIC3D_PATH', '/home/smiao/Gen_Dataset/dataset_methods/metric3d')
         model_path = os.getenv('METRIC3D_MODEL_PATH', '/nas/users/smiao/model_zoo/metric3d/metric_depth_vit_giant2_800k.pth')
         gpu_id = os.getenv('DEPTH_GPU_ID', '6')
@@ -209,6 +229,8 @@ class System():
 
     def gen_semantic(self):
         # 使用 OneFormer (Hugging Face Transformers) 替代 nvi_sem
+        if self.dir_name is None:
+            raise ValueError("dir_name is None, cannot generate semantic")
         script_path = os.path.join(os.path.dirname(__file__), 'gen_semantic_oneformer.py')
         gpu_id = os.getenv('SEMANTIC_GPU_ID', '0')
         model_name = os.getenv('ONEFORMER_MODEL_NAME', 'shi-labs/oneformer_cityscapes_swin_large')
@@ -224,23 +246,28 @@ class System():
         os.system(cmd)
 
     def gen_sky_mask(self):
+        if self.dir_name is None:
+            raise ValueError("dir_name is None, cannot generate sky mask")
         instance_path = os.path.join(self.dir_name, 'semantic', 'instance')
-        save_path = os.path.join(self.dir_name, 'mask')
-        os.makedirs(save_path,exist_ok=True)
-        image_height, image_width = self.H, self.W
+        save_path = os.path.join(self.dir_name, 'sky_masks')
+        os.makedirs(save_path, exist_ok=True)
+        image_height, image_width = int(self.H), int(self.W)
      
         for instance_fn in sorted(os.listdir(instance_path)):
             mask = np.ones((image_height, image_width), dtype=np.uint8)
             instance_file = os.path.join(instance_path, instance_fn)
             instance = cv2.imread(instance_file, -1)
-            mask[instance==10] = 0
-            mask = Image.fromarray(mask * 255)
+            # Sky class ID = 10, set to 0 (sky), others to 255 (non-sky)
+            mask[instance == 10] = 0
+            mask[instance != 10] = 255
+            mask = Image.fromarray(mask)
+            # Save with same filename format: {frame_idx:03d}_{cam_id}.png
             mask.save(os.path.join(save_path, instance_fn))
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Datasets parameters")
     parser.add_argument('--start_index',type = int,help=' Start index of Data',default=0)
-    parser.add_argument('--num_images',type = int,help='Num images',default=40)
+    parser.add_argument('--num_images',type = int,help='Num images (None means process all frames)',default=None)
     parser.add_argument('--seq_id',type = int,help='kitti360 sequence_id',default=0)
     parser.add_argument('--use_semantic',action='store_true')
     parser.add_argument('--use_metric_depth',action='store_true')
@@ -264,9 +291,9 @@ if __name__ == "__main__":
     system = System(save_dir=save_idr,sys_augments=sys_augments)
 
     if config.dataset == 'waymo':
-         system.Waymo_forward(num_frames=config.num_images)
+         system.Waymo_forward(num_frames=config.num_images if config.num_images is not None else 999999)
     elif config.dataset == 'kitti360':
-        system.forward(num_frames=config.num_images)
+        system.forward(num_frames=config.num_images if config.num_images is not None else 999999)
     elif config.dataset == 'nuscenes':
         system.NuScenes_forward(num_frames=config.num_images)
     else:

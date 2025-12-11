@@ -121,13 +121,23 @@ class NuScenesPCDGenerator():
         
         # Create mapping from (frame_idx, cam_id) to pose/intrinsic index
         # This assumes poses/intrinsics are in the same order as images: frame0_cam0, frame0_cam1, ..., frame1_cam0, ...
-        # We need to parse image filenames from the directory to build the mapping
-        image_files = sorted([f for f in os.listdir(self.dir_name) 
+        # We need to parse image filenames from the images directory to build the mapping
+        images_dir = os.path.join(self.dir_name, 'images')
+        if not os.path.exists(images_dir):
+            raise ValueError(f"Images directory not found: {images_dir}")
+        image_files = sorted([f for f in os.listdir(images_dir) 
                              if f.endswith('.jpg') or f.endswith('.png')])
         
         # Build mapping: (frame_idx, cam_id) -> index in poses/intrinsics
+        # Note: poses/intrinsics are ordered as: frame0_cam0, frame0_cam1, ..., frame1_cam0, ...
+        # So we need to sort by frame_idx first, then by cam_id
         pose_map = {}
-        for idx, img_file in enumerate(image_files):
+        # Sort image files by frame_idx and cam_id to match poses order
+        sorted_image_files = sorted(image_files, key=lambda x: (
+            int(x.split('_')[0]) if x.split('_')[0].isdigit() else 999999,
+            int(x.split('_')[1].split('.')[0]) if len(x.split('_')) > 1 and x.split('_')[1].split('.')[0].isdigit() else 999999
+        ))
+        for idx, img_file in enumerate(sorted_image_files):
             try:
                 # Image naming: {frame_idx:03d}_{cam_id}.jpg or .png
                 parts = img_file.replace('.jpg', '').replace('.png', '').split('_')
@@ -151,7 +161,9 @@ class NuScenesPCDGenerator():
                         idx = pose_map[(frame_idx, cam_id)]
                         if idx < len(poses):
                             valid_depth_files.append(file_name)
-                            self.c2w.append(poses[idx] * np.array([1, -1, -1, 1]))
+                            # Use poses directly without coordinate conversion
+                            # (poses are already aligned and in correct coordinate system)
+                            self.c2w.append(poses[idx])
                             self.intri.append(intrinsics[idx])
                             selected_index.append(idx)
                         else:
@@ -258,10 +270,10 @@ class NuScenesPCDGenerator():
             
             # Find corresponding RGB image
             # Depth file: {frame_idx:03d}_{cam_id}.npy
-            # RGB file: {frame_idx:03d}_{cam_id}.jpg
-            rgb_file = os.path.join(self.dir_name, file_name.replace('.npy', '.jpg'))
+            # RGB file: images/{frame_idx:03d}_{cam_id}.jpg
+            rgb_file = os.path.join(self.dir_name, 'images', file_name.replace('.npy', '.jpg'))
             if not os.path.exists(rgb_file):
-                rgb_file = os.path.join(self.dir_name, file_name.replace('.npy', '.png'))
+                rgb_file = os.path.join(self.dir_name, 'images', file_name.replace('.npy', '.png'))
             
             if not os.path.exists(rgb_file):
                 CONSOLE.log(f"Warning: RGB file not found for {file_name}")
@@ -269,24 +281,20 @@ class NuScenesPCDGenerator():
                 
             rgb = imageio.imread(rgb_file) / 255.0
 
-            # Apply sky filtering if enabled
+            # Apply sky filtering if enabled (use sky_masks instead of semantic/instance)
             if self.filter_sky:
-                instance_file = os.path.join(
-                    self.dir_name, 'semantic', 'instance', 
+                sky_mask_file = os.path.join(
+                    self.dir_name, 'sky_masks', 
                     file_name.replace('.npy', '.png')
                 )
-                if os.path.exists(instance_file):
-                    instance = cv2.imread(instance_file, -1)
-                    erosion = np.ones_like(rgb)
-                    erosion[instance == 10] = (0, 0, 0)  # Sky class ID = 10
-                    erosion[instance != 10] = (255, 255, 255)
-                    # Add erosion for sky binary mask (use larger kernel like Waymo)
-                    kernel = np.ones((30, 30), np.uint8)
-                    erosion = cv2.erode(erosion, kernel, iterations=1)
-                    mask = np.all(erosion != [0, 0, 0], axis=2)
+                if os.path.exists(sky_mask_file):
+                    sky_mask = cv2.imread(sky_mask_file, cv2.IMREAD_GRAYSCALE)
+                    # sky_masks: 0 = sky, 255 = non-sky
+                    # Convert to boolean: True = non-sky (keep), False = sky (filter)
+                    mask = (sky_mask > 0).astype(np.bool_)
                     final_mask = np.logical_and(consistency_mask[i], mask)
                 else:
-                    CONSOLE.log(f"Warning: Semantic mask not found: {instance_file}")
+                    CONSOLE.log(f"Warning: Sky mask not found: {sky_mask_file}, skipping sky filtering")
                     final_mask = consistency_mask[i]
             else:
                 final_mask = consistency_mask[i]
