@@ -40,6 +40,55 @@ def load_intrinsics(path:str):
     return np.stack([meta['fl_x'],meta['fl_y'],meta['cx'], meta['cy']])
 
 def load_data(path: str, dataset: str):
+    if dataset == 'nuscenes':
+        # NuScenes specific: images are in path/images/ directory
+        images_dir = os.path.join(path, 'images')
+        intrinsics_dir = os.path.join(path, 'intrinsics')
+        
+        if not os.path.exists(images_dir):
+            raise ValueError(f"Images directory not found: {images_dir}")
+        if not os.path.exists(intrinsics_dir):
+            raise ValueError(f"Intrinsics directory not found: {intrinsics_dir}")
+        
+        # Load all images
+        rgbs = sorted(glob.glob(os.path.join(images_dir, '*.jpg')) + 
+                      glob.glob(os.path.join(images_dir, '*.png')))
+        
+        # For each image, extract cam_id from filename (format: {frame_idx:03d}_{cam_id}.jpg)
+        # and load corresponding intrinsics
+        data = []
+        for rgb in rgbs:
+            filename = os.path.basename(rgb)
+            # Extract cam_id from filename (e.g., "000_0.jpg" -> "0")
+            try:
+                cam_id = filename.split('_')[-1].split('.')[0]
+                intrinsic_file = os.path.join(intrinsics_dir, f"{cam_id}.txt")
+                
+                if os.path.exists(intrinsic_file):
+                    # Load intrinsics: format is [fx, fy, cx, cy, k1, k2, p1, p2, k3]
+                    intrinsic_data = np.loadtxt(intrinsic_file)
+                    # Extract first 4 values: [fx, fy, cx, cy]
+                    intrinsics = [float(intrinsic_data[0]), float(intrinsic_data[1]), 
+                                 float(intrinsic_data[2]), float(intrinsic_data[3])]
+                else:
+                    # Fallback: use default intrinsics if file not found
+                    print(f"Warning: Intrinsic file not found: {intrinsic_file}, using default intrinsics")
+                    intrinsics = [1000.0, 1000.0, 640.0, 360.0]  # Default values
+            except Exception as e:
+                print(f"Warning: Failed to parse cam_id from {filename}: {e}, using default intrinsics")
+                intrinsics = [1000.0, 1000.0, 640.0, 360.0]  # Default values
+            
+            data.append({
+                'rgb': rgb,
+                'depth': None,
+                'intrinsic': intrinsics,
+                'filename': filename,
+                'folder': os.path.basename(path)
+            })
+        
+        return data
+    
+    # Original logic for other datasets
     rgbs = sorted(glob.glob(path + '/*.jpg') + glob.glob(path + '/*.png') + 
                   glob.glob(path + '/front_images'+ '/*.jpg') + glob.glob(path + '/front_images'+ '/*.png'))
     # print("This is the rgb path: ", path)

@@ -21,6 +21,8 @@ import os
 import sys
 import cv2
 import numpy as np
+import subprocess
+import shutil
 from argparse import ArgumentParser
 from PIL import Image
 from rich.console import Console
@@ -45,9 +47,18 @@ def gen_metric_depth(scene_dir: str, dataset: str = 'nuscenes', gpu_id: str = '6
         raise ValueError(f"Images directory not found: {images_dir}")
     
     depth_dir = os.path.join(scene_dir, 'depth')
+    
+    # 如果目录已存在，删除它以重新生成
     if os.path.exists(depth_dir):
-        CONSOLE.log(f"Depth directory already exists: {depth_dir}, skipping depth generation")
-        return
+        depth_files = [f for f in os.listdir(depth_dir) if f.endswith(('.png', '.npy', '.npz'))]
+        if len(depth_files) > 0:
+            CONSOLE.log(f"Depth directory exists with {len(depth_files)} files. Removing to regenerate...")
+        else:
+            CONSOLE.log(f"Depth directory exists but is empty. Removing to regenerate...")
+        shutil.rmtree(depth_dir)
+    
+    # 创建depth目录
+    os.makedirs(depth_dir, exist_ok=True)
     
     metric3d_path = os.getenv('METRIC3D_PATH', '/home/smiao/Gen_Dataset/dataset_methods/metric3d')
     model_path = os.getenv('METRIC3D_MODEL_PATH', '/nas/users/smiao/model_zoo/metric3d/metric_depth_vit_giant2_800k.pth')
@@ -56,15 +67,63 @@ def gen_metric_depth(scene_dir: str, dataset: str = 'nuscenes', gpu_id: str = '6
         raise ValueError(f"METRIC3D_PATH not found: {metric3d_path}. Please set METRIC3D_PATH environment variable.")
     
     CONSOLE.log(f"Generating metric depth for scene: {scene_dir}")
-    cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} python {metric3d_path}/mono/tools/test_scale_cano.py \
-        {metric3d_path}/mono/configs/HourglassDecoder/vit.raft5.giant2.py \
-        --load-from {model_path} \
-        --test_data_path {scene_dir} --show-dir {depth_dir} \
-        --dataset {dataset} \
-        --launcher None"
     
-    os.system(cmd)
-    CONSOLE.log(f"Depth generation completed. Results saved to: {depth_dir}")
+    # 构建命令
+    env = os.environ.copy()
+    env['CUDA_VISIBLE_DEVICES'] = gpu_id
+    
+    cmd = [
+        sys.executable,
+        os.path.join(metric3d_path, 'mono', 'tools', 'test_scale_cano.py'),
+        os.path.join(metric3d_path, 'mono', 'configs', 'HourglassDecoder', 'vit.raft5.giant2.py'),
+        '--load-from', model_path,
+        '--test_data_path', scene_dir,
+        '--show-dir', depth_dir,
+        '--dataset', dataset,
+        '--launcher', 'None'
+    ]
+    
+    try:
+        CONSOLE.log(f"Running command: python {' '.join(cmd[1:])}")  # 不显示完整路径以保持简洁
+        
+        result = subprocess.run(
+            cmd,
+            env=env,
+            cwd=metric3d_path,
+            capture_output=True,
+            text=True,
+            timeout=7200  # 2小时超时
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr if result.stderr else result.stdout
+            CONSOLE.log(f"[red]Depth generation command failed with exit code {result.returncode}[/red]")
+            if error_msg:
+                # 显示完整的错误信息（最多2000字符）
+                error_display = error_msg[-2000:] if len(error_msg) > 2000 else error_msg
+                CONSOLE.log(f"[red]Error output:[/red]")
+                CONSOLE.log(f"[red]{error_display}[/red]")
+            raise RuntimeError(f"Depth generation failed with exit code {result.returncode}")
+        
+        # 显示输出（如果有）
+        if result.stdout:
+            CONSOLE.log(f"[dim]{result.stdout[-500:]}[/dim]")  # 显示最后500字符
+        
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Depth generation timed out after 2 hours")
+    except Exception as e:
+        raise RuntimeError(f"Depth generation error: {e}")
+    
+    # 验证输出目录是否存在且有文件
+    if not os.path.exists(depth_dir):
+        raise RuntimeError(f"Depth directory not created: {depth_dir}")
+    
+    # 检查是否有输出文件
+    depth_files = [f for f in os.listdir(depth_dir) if f.endswith(('.png', '.npy', '.npz'))]
+    if len(depth_files) == 0:
+        raise RuntimeError(f"No depth files found in {depth_dir}. Generation may have failed.")
+    
+    CONSOLE.log(f"[green]Depth generation completed. {len(depth_files)} files saved to: {depth_dir}[/green]")
 
 
 def gen_semantic(scene_dir: str, gpu_id: str = '0', model_name: str = 'shi-labs/oneformer_cityscapes_swin_large'):
@@ -84,25 +143,90 @@ def gen_semantic(scene_dir: str, gpu_id: str = '0', model_name: str = 'shi-labs/
         raise ValueError(f"Images directory not found: {images_dir}")
     
     semantic_dir = os.path.join(scene_dir, 'semantic')
+    instance_dir = os.path.join(semantic_dir, 'instance')
+    
+    # 如果目录已存在，删除它以重新生成
     if os.path.exists(semantic_dir):
-        CONSOLE.log(f"Semantic directory already exists: {semantic_dir}, skipping semantic generation")
-        return
+        instance_files = []
+        if os.path.exists(instance_dir):
+            instance_files = [f for f in os.listdir(instance_dir) if f.endswith('.png')]
+        if len(instance_files) > 0:
+            CONSOLE.log(f"Semantic directory exists with {len(instance_files)} files. Removing to regenerate...")
+        else:
+            CONSOLE.log(f"Semantic directory exists. Removing to regenerate...")
+        shutil.rmtree(semantic_dir)
+    
+    # 创建semantic目录（如果不存在，子脚本也会创建，但先创建更安全）
+    os.makedirs(instance_dir, exist_ok=True)
     
     script_path = os.path.join(os.path.dirname(__file__), 'gen_semantic_oneformer.py')
     if not os.path.exists(script_path):
         raise ValueError(f"Semantic generation script not found: {script_path}")
     
     CONSOLE.log(f"Generating semantic segmentation for scene: {scene_dir}")
-    cmd = f"CUDA_VISIBLE_DEVICES={gpu_id} python {script_path} \
-           --input_dir {scene_dir} \
-           --output_dir {scene_dir} \
-           --model_name {model_name} \
-           --task semantic \
-           --device cuda \
-           --gpu_id {gpu_id}"
     
-    os.system(cmd)
-    CONSOLE.log(f"Semantic generation completed. Results saved to: {semantic_dir}")
+    # 图像目录应该是 scene_dir/images
+    images_dir = os.path.join(scene_dir, 'images')
+    if not os.path.exists(images_dir):
+        raise ValueError(f"Images directory not found: {images_dir}")
+    
+    # 构建命令
+    env = os.environ.copy()
+    env['CUDA_VISIBLE_DEVICES'] = gpu_id
+    
+    cmd = [
+        sys.executable, script_path,
+        '--input_dir', images_dir,  # 使用 images 目录作为输入
+        '--output_dir', scene_dir,  # 输出到 scene_dir
+        '--model_name', model_name,
+        '--task', 'semantic',
+        '--device', 'cuda',
+        '--gpu_id', gpu_id
+    ]
+    
+    try:
+        result = subprocess.run(
+            cmd,
+            env=env,
+            cwd=os.path.dirname(script_path),
+            capture_output=True,
+            text=True,
+            timeout=7200  # 2小时超时
+        )
+        
+        if result.returncode != 0:
+            error_msg = result.stderr if result.stderr else result.stdout
+            CONSOLE.log(f"[red]Semantic generation command failed with exit code {result.returncode}[/red]")
+            if error_msg:
+                # 显示完整的错误信息（最多2000字符）
+                error_display = error_msg[-2000:] if len(error_msg) > 2000 else error_msg
+                CONSOLE.log(f"[red]Error output:[/red]")
+                CONSOLE.log(f"[red]{error_display}[/red]")
+            else:
+                CONSOLE.log(f"[red]No error output captured. Check if transformers and other dependencies are installed.[/red]")
+                CONSOLE.log(f"[yellow]Try running: pip install transformers torch pillow opencv-python-headless tqdm[/yellow]")
+            raise RuntimeError(f"Semantic generation failed with exit code {result.returncode}")
+        
+        # 显示输出（如果有）
+        if result.stdout:
+            CONSOLE.log(f"[dim]{result.stdout[-500:]}[/dim]")  # 显示最后500字符
+        
+    except subprocess.TimeoutExpired:
+        raise RuntimeError("Semantic generation timed out after 2 hours")
+    except Exception as e:
+        raise RuntimeError(f"Semantic generation error: {e}")
+    
+    # 验证输出目录是否存在
+    instance_dir = os.path.join(semantic_dir, 'instance')
+    if not os.path.exists(instance_dir):
+        raise RuntimeError(f"Semantic instance directory not created: {instance_dir}")
+    
+    # 检查是否有输出文件
+    instance_files = [f for f in os.listdir(instance_dir) if f.endswith('.png')]
+    if len(instance_files) == 0:
+        raise RuntimeError(f"No semantic segmentation files found in {instance_dir}")
+    
+    CONSOLE.log(f"[green]Semantic generation completed. {len(instance_files)} files saved to: {instance_dir}[/green]")
 
 
 def gen_sky_mask(scene_dir: str):
@@ -117,7 +241,18 @@ def gen_sky_mask(scene_dir: str):
     
     instance_path = os.path.join(scene_dir, 'semantic', 'instance')
     if not os.path.exists(instance_path):
-        raise ValueError(f"Semantic instance directory not found: {instance_path}. Please run semantic generation first.")
+        raise ValueError(
+            f"Semantic instance directory not found: {instance_path}.\n"
+            f"Please run semantic generation first using --gen_semantic flag."
+        )
+    
+    # 检查是否有实例文件
+    instance_files = [f for f in os.listdir(instance_path) if f.endswith('.png')]
+    if len(instance_files) == 0:
+        raise ValueError(
+            f"No semantic segmentation files found in {instance_path}.\n"
+            f"Please run semantic generation first using --gen_semantic flag."
+        )
     
     save_path = os.path.join(scene_dir, 'sky_masks')
     os.makedirs(save_path, exist_ok=True)
@@ -186,7 +321,7 @@ def main():
         CONSOLE.log(f"[red]Error: Images directory not found: {images_dir}[/red]")
         sys.exit(1)
     
-    # 执行生成任务
+    # 执行生成任务（注意顺序：先语义分割，再天空mask）
     if args.gen_depth:
         try:
             gen_metric_depth(args.scene_dir, args.dataset, args.depth_gpu_id)
@@ -203,6 +338,27 @@ def main():
     
     if args.gen_sky_mask:
         try:
+            # 检查语义分割是否已完成（不仅检查目录，还要检查是否有文件）
+            instance_path = os.path.join(args.scene_dir, 'semantic', 'instance')
+            instance_files = []
+            if os.path.exists(instance_path):
+                instance_files = [f for f in os.listdir(instance_path) if f.endswith('.png')]
+            
+            if not os.path.exists(instance_path) or len(instance_files) == 0:
+                CONSOLE.log(f"[yellow]Warning: Semantic instance directory not found or empty: {instance_path}[/yellow]")
+                CONSOLE.log(f"[yellow]Attempting to generate semantic segmentation first...[/yellow]")
+                # 如果语义分割未完成，尝试生成
+                if not args.gen_semantic:
+                    try:
+                        gen_semantic(args.scene_dir, args.semantic_gpu_id, args.model_name)
+                        # 再次检查
+                        if os.path.exists(instance_path):
+                            instance_files = [f for f in os.listdir(instance_path) if f.endswith('.png')]
+                        if len(instance_files) == 0:
+                            raise RuntimeError("Semantic generation completed but no files were created")
+                    except Exception as e:
+                        CONSOLE.log(f"[red]Error: Cannot generate sky mask without semantic segmentation: {e}[/red]")
+                        sys.exit(1)
             gen_sky_mask(args.scene_dir)
         except Exception as e:
             CONSOLE.log(f"[red]Error generating sky mask: {e}[/red]")
