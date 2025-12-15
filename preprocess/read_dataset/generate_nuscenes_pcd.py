@@ -91,7 +91,7 @@ class NuScenesPCDGenerator():
                 if frame_idx not in frame_groups:
                     frame_groups[frame_idx] = []
                 frame_groups[frame_idx].append(file_name)
-            except (ValueError, IndexError):
+            except (ValueError, IndexError) as e:
                 CONSOLE.log(f"Warning: Cannot parse filename {file_name}, skipping")
                 continue
         
@@ -199,7 +199,8 @@ class NuScenesPCDGenerator():
         )
 
         # Output and save the .ply pointcloud
-        os.makedirs(os.path.join(self.dir_name, self.save_dir), exist_ok=True)
+        save_path = os.path.join(self.dir_name, self.save_dir)
+        os.makedirs(save_path, exist_ok=True)
 
         points = accumulated_pointcloud[:, :3]
         colors = accumulated_pointcloud[:, 3:]
@@ -233,10 +234,11 @@ class NuScenesPCDGenerator():
             combined_pointcloud = inside_pointcloud + outside_pointcloud
             combined_pointcloud = combined_pointcloud.uniform_down_sample(every_k_points=2)
             
-            o3d.io.write_point_cloud(
-                os.path.join(self.dir_name, self.save_dir, f'{self.frame_start}.ply'), 
-                combined_pointcloud
-            )
+            output_file = os.path.join(self.dir_name, self.save_dir, f'{self.frame_start}.ply')
+            try:
+                o3d.io.write_point_cloud(output_file, combined_pointcloud)
+            except Exception as e:
+                raise
             print(f"Save the pointcloud in {os.path.join(self.dir_name, self.save_dir)} !")
         else:
             point_cloud = o3d.geometry.PointCloud()
@@ -250,10 +252,11 @@ class NuScenesPCDGenerator():
             point_cloud = point_cloud.select_by_index(ind)
             point_cloud = point_cloud.uniform_down_sample(every_k_points=3)
             
-            o3d.io.write_point_cloud(
-                os.path.join(self.dir_name, self.save_dir, f'{self.frame_start}.ply'), 
-                point_cloud
-            )
+            output_file = os.path.join(self.dir_name, self.save_dir, f'{self.frame_start}.ply')
+            try:
+                o3d.io.write_point_cloud(output_file, point_cloud)
+            except Exception as e:
+                raise
             print(f"Save the pointcloud in {os.path.join(self.dir_name, self.save_dir)} !")
 
     def accumulat_pcd(self, depth_files, consistency_mask, down_scale: int = 2):
@@ -266,7 +269,10 @@ class NuScenesPCDGenerator():
 
         for i, file_name in enumerate(depth_files):
             depth_file = os.path.join(self.depth_dir, file_name)
-            depth = np.load(depth_file)
+            try:
+                depth = np.load(depth_file)
+            except Exception as e:
+                continue
             
             # Find corresponding RGB image
             # Depth file: {frame_idx:03d}_{cam_id}.npy
@@ -278,8 +284,11 @@ class NuScenesPCDGenerator():
             if not os.path.exists(rgb_file):
                 CONSOLE.log(f"Warning: RGB file not found for {file_name}")
                 continue
-                
-            rgb = imageio.imread(rgb_file) / 255.0
+            
+            try:
+                rgb = imageio.imread(rgb_file) / 255.0
+            except Exception as e:
+                continue
 
             # Apply sky filtering if enabled (use sky_masks instead of semantic/instance)
             if self.filter_sky:
@@ -311,8 +320,20 @@ class NuScenesPCDGenerator():
             depth_values = depth[kept[:, 0], kept[:, 1]]
             rgb_values = rgb[kept[:, 0], kept[:, 1]]
             
-            c2w = self.c2w[i]
-            K = self.intri[i]
+            # Filter out invalid depth values (NaN, inf, zero, negative)
+            valid_depth_mask = np.isfinite(depth_values) & (depth_values > 0)
+            if not np.any(valid_depth_mask):
+                continue
+            
+            depth_values = depth_values[valid_depth_mask]
+            rgb_values = rgb_values[valid_depth_mask]
+            kept_valid = kept[valid_depth_mask]
+            
+            try:
+                c2w = self.c2w[i]
+                K = self.intri[i]
+            except IndexError as e:
+                continue
 
             # Generate pixel coordinates
             x = np.arange(0, self.W)
@@ -321,23 +342,48 @@ class NuScenesPCDGenerator():
             pixels = np.vstack((xx.ravel(), yy.ravel())).T.reshape(self.H, self.W, 2)
 
             # Unproject depth to 3D points
-            pixel_coords = pixels[kept[:, 0], kept[:, 1]]
+            pixel_coords = pixels[kept_valid[:, 0], kept_valid[:, 1]]
             x_cam = (pixel_coords[:, 0] - K[0, 2]) * depth_values / K[0, 0]
             y_cam = (pixel_coords[:, 1] - K[1, 2]) * depth_values / K[1, 1]
             z_cam = depth_values
             coordinates = np.stack([x_cam, y_cam, z_cam], axis=1)
+            
+            # Filter out NaN/inf coordinates
+            valid_coords_mask = np.isfinite(coordinates).all(axis=1)
+            if not np.any(valid_coords_mask):
+                continue
+            
+            coordinates = coordinates[valid_coords_mask]
+            rgb_values = rgb_values[valid_coords_mask]
             coordinates = np.column_stack((coordinates, np.ones(len(coordinates))))
 
             # Transform to world coordinates
             worlds = np.dot(c2w, coordinates.T).T
             worlds = worlds[:, :3]
+            
+            # Filter out NaN/inf world coordinates
+            valid_worlds_mask = np.isfinite(worlds).all(axis=1)
+            if not np.any(valid_worlds_mask):
+                continue
+            
+            worlds = worlds[valid_worlds_mask]
+            rgb_values = rgb_values[valid_worlds_mask]
 
-            color_pointclouds.append(np.concatenate([worlds, rgb_values.reshape(-1, 3)], axis=-1))
+            point_cloud_chunk = np.concatenate([worlds, rgb_values.reshape(-1, 3)], axis=-1)
+            color_pointclouds.append(point_cloud_chunk)
 
         if len(color_pointclouds) == 0:
             raise ValueError("No valid point cloud generated")
             
         point_clouds = np.concatenate(color_pointclouds, axis=0).reshape(-1, 6)
+        
+        # Final filter: remove any remaining NaN/inf values
+        valid_mask = np.isfinite(point_clouds[:, :3]).all(axis=1)
+        if not np.any(valid_mask):
+            raise ValueError("No valid point cloud after NaN filtering")
+        
+        point_clouds = point_clouds[valid_mask]
+        
         return point_clouds
 
     def depth_cosistency_check(self, depth_files):
@@ -347,7 +393,10 @@ class NuScenesPCDGenerator():
         
         for i, file_name in enumerate(depth_files):
             depth_file = os.path.join(self.depth_dir, file_name)
-            depth = np.load(depth_file)
+            try:
+                depth = np.load(depth_file)
+            except Exception as e:
+                continue
 
             # Assume the first depth frame is correct
             if i == 0:
@@ -355,9 +404,13 @@ class NuScenesPCDGenerator():
                 depth_masks.append(np.ones((self.H, self.W)))
                 continue
 
-            c2w = self.c2w[i]
-            last_c2w = self.c2w[i-1]
-            K = self.intri[i]
+            try:
+                c2w = self.c2w[i]
+                last_c2w = self.c2w[i-1]
+                K = self.intri[i]
+            except IndexError as e:
+                depth_masks.append(np.ones((self.H, self.W)))
+                continue
 
             # Unproject pointcloud
             x = np.arange(0, depth.shape[1])

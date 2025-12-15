@@ -50,6 +50,9 @@ def load_data(path: str, dataset: str):
         if not os.path.exists(intrinsics_dir):
             raise ValueError(f"Intrinsics directory not found: {intrinsics_dir}")
         
+        # Extract scene name (directory name, e.g., "000")
+        scene_name = os.path.basename(os.path.abspath(path))
+        
         # Load all images
         rgbs = sorted(glob.glob(os.path.join(images_dir, '*.jpg')) + 
                       glob.glob(os.path.join(images_dir, '*.png')))
@@ -83,7 +86,7 @@ def load_data(path: str, dataset: str):
                 'depth': None,
                 'intrinsic': intrinsics,
                 'filename': filename,
-                'folder': os.path.basename(path)
+                'folder': f'{scene_name}/depth'  # For identification only, doesn't affect save path
             })
         
         return data
