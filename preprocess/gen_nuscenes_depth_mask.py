@@ -30,7 +30,7 @@ from rich.console import Console
 CONSOLE = Console(width=120)
 
 
-def gen_metric_depth(scene_dir: str, dataset: str = 'nuscenes', gpu_id: str = '6'):
+def gen_metric_depth(scene_dir: str, dataset: str = 'nuscenes', gpu_id: str = '6', cam_id: int = 0):
     """
     生成 metric depth 使用 Metric3D。
     
@@ -60,27 +60,31 @@ def gen_metric_depth(scene_dir: str, dataset: str = 'nuscenes', gpu_id: str = '6
     # 创建depth目录
     os.makedirs(depth_dir, exist_ok=True)
     
-    metric3d_path = os.getenv('METRIC3D_PATH', '/home/smiao/Gen_Dataset/dataset_methods/metric3d')
-    model_path = os.getenv('METRIC3D_MODEL_PATH', '/nas/users/smiao/model_zoo/metric3d/metric_depth_vit_giant2_800k.pth')
+    # 默认路径：相对于当前脚本的路径
+    default_metric3d_path = os.path.join(os.path.dirname(__file__), 'metric3d')
+    metric3d_path = os.getenv('METRIC3D_PATH', default_metric3d_path)
     
     if not os.path.exists(metric3d_path):
         raise ValueError(f"METRIC3D_PATH not found: {metric3d_path}. Please set METRIC3D_PATH environment variable.")
     
     CONSOLE.log(f"Generating metric depth for scene: {scene_dir}")
+    CONSOLE.log(f"Using torch.hub Metric3D model (no local model file required)")
     
     # 构建命令
     env = os.environ.copy()
     env['CUDA_VISIBLE_DEVICES'] = gpu_id
     
+    # 使用基于 torch.hub 的 Metric3D 推理脚本
+    # 注意：hub 版本不需要 --load-from 参数（模型从 GitHub 加载）
     cmd = [
         sys.executable,
-        os.path.join(metric3d_path, 'mono', 'tools', 'test_scale_cano.py'),
+        os.path.join(metric3d_path, 'mono', 'tools', 'test_scale_cano_hub.py'),
         os.path.join(metric3d_path, 'mono', 'configs', 'HourglassDecoder', 'vit.raft5.giant2.py'),
-        '--load-from', model_path,
         '--test_data_path', scene_dir,
         '--show-dir', depth_dir,
         '--dataset', dataset,
-        '--launcher', 'None'
+        '--launcher', 'None',
+        '--cam_id', str(cam_id)
     ]
     
     try:
@@ -126,7 +130,7 @@ def gen_metric_depth(scene_dir: str, dataset: str = 'nuscenes', gpu_id: str = '6
     CONSOLE.log(f"[green]Depth generation completed. {len(depth_files)} files saved to: {depth_dir}[/green]")
 
 
-def gen_semantic(scene_dir: str, gpu_id: str = '0', model_name: str = 'shi-labs/oneformer_cityscapes_swin_large'):
+def gen_semantic(scene_dir: str, gpu_id: str = '0', model_name: str = 'shi-labs/oneformer_cityscapes_swin_large', cam_id: int = 0):
     """
     生成语义分割使用 OneFormer。
     
@@ -181,7 +185,8 @@ def gen_semantic(scene_dir: str, gpu_id: str = '0', model_name: str = 'shi-labs/
         '--model_name', model_name,
         '--task', 'semantic',
         '--device', 'cuda',
-        '--gpu_id', gpu_id
+        '--gpu_id', gpu_id,
+        '--cam_id', str(cam_id)
     ]
     
     try:
@@ -308,6 +313,7 @@ def main():
                        help='GPU ID for semantic generation (default: 0)')
     parser.add_argument('--model_name', type=str, default='shi-labs/oneformer_cityscapes_swin_large',
                        help='OneFormer model name (default: shi-labs/oneformer_cityscapes_swin_large)')
+    parser.add_argument('--cam_id', type=int, default=0, help='the camera id')
     
     args = parser.parse_args()
     
@@ -324,14 +330,14 @@ def main():
     # 执行生成任务（注意顺序：先语义分割，再天空mask）
     if args.gen_depth:
         try:
-            gen_metric_depth(args.scene_dir, args.dataset, args.depth_gpu_id)
+            gen_metric_depth(args.scene_dir, args.dataset, args.depth_gpu_id, args.cam_id)
         except Exception as e:
             CONSOLE.log(f"[red]Error generating depth: {e}[/red]")
             sys.exit(1)
     
     if args.gen_semantic:
         try:
-            gen_semantic(args.scene_dir, args.semantic_gpu_id, args.model_name)
+            gen_semantic(args.scene_dir, args.semantic_gpu_id, args.model_name, args.cam_id)
         except Exception as e:
             CONSOLE.log(f"[red]Error generating semantic: {e}[/red]")
             sys.exit(1)
@@ -350,7 +356,7 @@ def main():
                 # 如果语义分割未完成，尝试生成
                 if not args.gen_semantic:
                     try:
-                        gen_semantic(args.scene_dir, args.semantic_gpu_id, args.model_name)
+                        gen_semantic(args.scene_dir, args.semantic_gpu_id, args.model_name, args.cam_id)
                         # 再次检查
                         if os.path.exists(instance_path):
                             instance_files = [f for f in os.listdir(instance_path) if f.endswith('.png')]

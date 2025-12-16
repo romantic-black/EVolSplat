@@ -39,19 +39,17 @@ def load_intrinsics(path:str):
         # intris.append(np.stack([K[0][0],K[1][1],K[0][2],K[1][2]]))
     return np.stack([meta['fl_x'],meta['fl_y'],meta['cx'], meta['cy']])
 
-def load_data(path: str, dataset: str):
+def load_data(path: str, dataset: str, chosen_cam_id: int = None):
     if dataset == 'nuscenes':
         # NuScenes specific: images are in path/images/ directory
         images_dir = os.path.join(path, 'images')
         intrinsics_dir = os.path.join(path, 'intrinsics')
+        scene_name = os.path.basename(path.rstrip(os.sep))
         
         if not os.path.exists(images_dir):
             raise ValueError(f"Images directory not found: {images_dir}")
         if not os.path.exists(intrinsics_dir):
             raise ValueError(f"Intrinsics directory not found: {intrinsics_dir}")
-        
-        # Extract scene name (directory name, e.g., "000")
-        scene_name = os.path.basename(os.path.abspath(path))
         
         # Load all images
         rgbs = sorted(glob.glob(os.path.join(images_dir, '*.jpg')) + 
@@ -64,8 +62,13 @@ def load_data(path: str, dataset: str):
             filename = os.path.basename(rgb)
             # Extract cam_id from filename (e.g., "000_0.jpg" -> "0")
             try:
-                cam_id = filename.split('_')[-1].split('.')[0]
-                intrinsic_file = os.path.join(intrinsics_dir, f"{cam_id}.txt")
+                cam_id_str = filename.split('_')[-1].split('.')[0]
+                cam_id = int(cam_id_str)
+                # 如果指定了 chosen_cam_id，只处理该相机的图像
+                if chosen_cam_id is not None and cam_id != chosen_cam_id:
+                    continue
+                # cam_id_str 已经是字符串格式，直接使用
+                intrinsic_file = os.path.join(intrinsics_dir, f"{cam_id_str}.txt")
                 
                 if os.path.exists(intrinsic_file):
                     # Load intrinsics: format is [fx, fy, cx, cy, k1, k2, p1, p2, k3]
@@ -86,7 +89,8 @@ def load_data(path: str, dataset: str):
                 'depth': None,
                 'intrinsic': intrinsics,
                 'filename': filename,
-                'folder': f'{scene_name}/depth'  # For identification only, doesn't affect save path
+                # folder points to scene_name/depth, e.g. 000/depth
+                'folder': f"{scene_name}/depth"
             })
         
         return data

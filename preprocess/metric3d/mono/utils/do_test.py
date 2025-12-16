@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
 import logging
 import os
 import os.path as osp
@@ -301,6 +300,8 @@ def do_scalecano_test_with_custom_data(
 
             # pcd
             pred_depth = pred_depth.detach().cpu().numpy()
+            # save as float16 to reduce storage size
+            pred_depth = pred_depth.astype(np.float16)
             np.save(osp.join(save_pcd_dir, an['filename'][:-4]+'.npy'), pred_depth)
             # pcd = reconstruct_pcd(pred_depth, intrinsic[0], intrinsic[1], intrinsic[2], intrinsic[3])
             # os.makedirs(osp.join(save_pcd_dir, an['folder']), exist_ok=True)

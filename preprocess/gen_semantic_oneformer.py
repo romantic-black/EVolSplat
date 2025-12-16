@@ -29,7 +29,7 @@ DYNAMIC_CLASS_IDS = {
 }
 
 
-def process_images(input_dir, output_dir, model_name="shi-labs/oneformer_cityscapes_swin_large", task="semantic", device="cuda"):
+def process_images(input_dir, output_dir, model_name="shi-labs/oneformer_cityscapes_swin_large", task="semantic", device="cuda", cam_id=0):
     """
     处理图像目录，生成语义分割掩码
     
@@ -55,8 +55,8 @@ def process_images(input_dir, output_dir, model_name="shi-labs/oneformer_citysca
     image_files = []
     for ext in image_extensions:
         image_files.extend(Path(input_dir).glob(f'*{ext}'))
-    image_files = sorted(image_files)
-    
+    image_files = sorted(image_files) # "000_0.jpg" -> "000_1.jpg" -> "000_2.jpg" -> ...
+    image_files = [img_path for img_path in image_files if int(img_path.stem.split('_')[-1]) == cam_id]
     print(f"找到 {len(image_files)} 张图像")
     
     # 处理每张图像
@@ -115,7 +115,7 @@ def main():
                        help="任务类型: semantic 或 panoptic")
     parser.add_argument("--device", type=str, default="cuda", help="设备: cuda 或 cpu")
     parser.add_argument("--gpu_id", type=str, default=None, help="GPU ID (如果指定，将设置 CUDA_VISIBLE_DEVICES)")
-    
+    parser.add_argument("--cam_id", type=int, default=0, help="相机 ID")
     args = parser.parse_args()
     
     # 设置 GPU
@@ -126,7 +126,7 @@ def main():
         print("警告: CUDA 不可用，使用 CPU")
         args.device = "cpu"
     
-    process_images(args.input_dir, args.output_dir, args.model_name, args.task, args.device)
+    process_images(args.input_dir, args.output_dir, args.model_name, args.task, args.device, args.cam_id)
 
 
 if __name__ == "__main__":
